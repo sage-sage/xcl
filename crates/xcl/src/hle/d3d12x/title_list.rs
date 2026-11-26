@@ -396,9 +396,12 @@ unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
 /// list's last reference.
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
-    let n = f(pc);
-    if n == 0 {
+    // (the books kept by the primary's address are cleared before its last Release, while the
+    // address is still this list's: freed, the driver can hand it to another thread's new list)
+    let last = add_ref(pc) == 2;
+    if last {
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();
@@ -420,6 +423,10 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             }
         }
         super::bind::forget(pc);
+    }
+    f(pc);
+    let n = f(pc);
+    if last {
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n
@@ -516,6 +523,11 @@ mod tests {
         f.last_arg3 = a3;
         0
     }
+    unsafe extern "system" fn rfake_add_ref(this: *mut c_void) -> u32 {
+        let f = &mut *(this as *mut ResetFake);
+        f.refs += 1;
+        f.refs
+    }
     unsafe extern "system" fn rfake_release(this: *mut c_void) -> u32 {
         let f = &mut *(this as *mut ResetFake);
         f.refs -= 1;
@@ -528,6 +540,7 @@ mod tests {
     #[test]
     fn newer_layout_slot_139_resets_primary_and_reclaims_split_segments() {
         let mut vt = vec![0usize; LIST_SLOTS];
+        vt[1] = rfake_add_ref as usize;
         vt[2] = rfake_release as usize;
         vt[10] = rfake_reset as usize;
         vt[139] = rfake_slot139 as usize;
@@ -567,6 +580,36 @@ mod tests {
         }
     }
 
+    /// The driver frees a list in its last Release; another thread can get a new list at that
+    /// address at once (`a_dispatch_with_a_pipeline_still_building_waits_at_the_submit` lost its
+    /// segment's pipeline that way in parallel runs). This fake's last Release records state for
+    /// its address as such a list would; the console object's release must not drop it after.
+    unsafe extern "system" fn reused_release(this: *mut c_void) -> u32 {
+        let f = &mut *(this as *mut ResetFake);
+        f.refs -= 1;
+        if f.refs == 0 {
+            super::super::bind::seed_reset_state_for_test(this, 0xA110_C003, 0x5EED, Vec::new());
+        }
+        f.refs
+    }
+
+    #[test]
+    fn a_release_keeps_the_state_of_a_new_list_at_the_freed_address() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[1] = rfake_add_ref as usize;
+        vt[2] = reused_release as usize;
+        let primary = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        unsafe {
+            let o = wrap(primary as *mut c_void);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(o as *const *const usize)).add(2));
+            assert_eq!(rel(o), 0);
+            let (alloc, pso, ..) = super::super::bind::reset_state_for_test(primary as *mut c_void);
+            super::super::bind::remove_state_for_test(primary as *mut c_void);
+            assert_eq!((alloc, pso), (0xA110_C003, 0x5EED), "the release dropped the state recorded at the freed address after the driver freed it");
+            drop(Box::from_raw(primary));
+        }
+    }
+
     unsafe extern "system" fn older_139(this: *mut c_void, a1: usize, a2: usize, a3: usize) -> HRESULT {
         rfake_slot139(this, a1, a2, a3);
         1
@@ -589,6 +632,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
         static NEWER: AtomicBool = AtomicBool::new(false);
         let mut vt = vec![0usize; LIST_SLOTS];
+        vt[1] = rfake_add_ref as usize;
         vt[2] = rfake_release as usize;
         vt[10] = rfake_reset as usize;
         vt[139] = super::super::guard::make_layout_split(super::super::guard::LayoutTargets {

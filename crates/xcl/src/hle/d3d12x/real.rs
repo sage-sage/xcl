@@ -7005,14 +7005,18 @@ unsafe extern "system" fn cl_execute_indirect(
 }
 
 unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
+    // What is kept by the list's address is dropped while the list still holds it: once the
+    // driver has freed the list, another thread can get a new one at the same address, and
+    // dropping it after the last Release dropped that list's state instead.
+    if add_ref(this) == 2 {
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
         super::dred::forget_list(this);
     }
-    n
+    f(this);
+    f(this)
 }
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
@@ -7821,6 +7825,47 @@ mod readback_routing_tests {
         let slots = console_slots(Kind::CommandList);
         assert!(slots.contains(&(53, l::clear_uav_uint_x as usize)));
         assert!(slots.contains(&(54, l::clear_uav_float_x as usize)));
+    }
+
+    #[repr(C)]
+    struct ReusedList {
+        vt: *const usize,
+        refs: u32,
+    }
+    unsafe extern "system" fn reused_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut ReusedList)).refs += 1;
+        (*(this as *mut ReusedList)).refs
+    }
+    /// As the driver frees the list, another thread's new list at its address records its state.
+    unsafe extern "system" fn reused_release(this: *mut c_void) -> u32 {
+        let l = &mut *(this as *mut ReusedList);
+        l.refs -= 1;
+        if l.refs == 0 {
+            super::super::bind::seed_reset_state_for_test(this, 0xA110_C004, 0x5EED, Vec::new());
+        }
+        l.refs
+    }
+
+    /// `cl_release` drops what is kept by the list's address before the driver frees the list,
+    /// not after: by then the address can be another list's.
+    #[test]
+    fn cl_release_keeps_the_state_of_a_new_list_at_the_freed_address() {
+        let mut orig_vt = [0usize; 3];
+        orig_vt[1] = reused_add_ref as usize;
+        orig_vt[2] = reused_release as usize;
+        let mut ext_vt = [0usize; 4];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let list = Box::into_raw(Box::new(ReusedList { vt: unsafe { ext_vt.as_ptr().add(1) }, refs: 2 }));
+        unsafe {
+            let raw = list as *mut c_void;
+            assert_eq!(cl_release(raw), 1);
+            assert_eq!(cl_release(raw), 0);
+            let (alloc, pso, ..) = super::super::bind::reset_state_for_test(raw);
+            super::super::bind::remove_state_for_test(raw);
+            assert_eq!((alloc, pso), (0xA110_C004, 0x5EED), "cl_release dropped the state recorded at the freed address after the driver freed it");
+            drop(Box::from_raw(list));
+        }
     }
 
     /// Bug #6: `Kind::DmaList` must install `cl_release` so releasing a DMA command list removes
